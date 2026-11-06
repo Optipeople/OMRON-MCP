@@ -9,5 +9,6 @@ func sysmacTools() []tool {
 	tools = append(tools, sysmacSLWDTools()...)
 	tools = append(tools, sysmacEntityTools()...)
 	tools = append(tools, sysmacTransactionTools()...)
+	tools = append(tools, sysmacLibraryTools()...)
 	return tools
 }

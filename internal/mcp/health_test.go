@@ -28,7 +28,7 @@ func TestProbeStartsConfiguredServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Probe() error = %v", err)
 	}
-	if health.Status != HealthConnected || health.ToolCount != 18 || health.ProtocolVersion != "2025-11-25" {
+	if health.Status != HealthConnected || health.ToolCount != 19 || health.ProtocolVersion != "2025-11-25" {
 		t.Fatalf("health = %#v", health)
 	}
 }
