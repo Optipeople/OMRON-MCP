@@ -17,6 +17,9 @@ type SLWDVariable struct {
 	InitialValue string `json:"initialValue,omitempty"`
 	Group        string `json:"group,omitempty"`
 	Comment      string `json:"comment,omitempty"`
+	// Attributes holds the remaining native SLWD fields (for example Ord,
+	// AT, R, RO, Const, E and EC) keyed without their "+" prefix.
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 func ReadStructuredText(path string) (string, error) {
