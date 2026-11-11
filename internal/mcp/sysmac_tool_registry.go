@@ -1,7 +1,7 @@
 package mcp
 
 func sysmacToolHandlers() map[string]sysmacToolHandler {
-	handlers := make(map[string]sysmacToolHandler, 18)
+	handlers := make(map[string]sysmacToolHandler, 20)
 	for _, group := range []map[string]sysmacToolHandler{
 		sysmacBuildToolHandlers(),
 		sysmacInspectTextToolHandlers(),
@@ -9,6 +9,7 @@ func sysmacToolHandlers() map[string]sysmacToolHandler {
 		sysmacEntityToolHandlers(),
 		sysmacTransactionToolHandlers(),
 		sysmacLibraryToolHandlers(),
+		sysmacCloudFBToolHandlers(),
 	} {
 		for name, handler := range group {
 			handlers[name] = handler
