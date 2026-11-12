@@ -146,3 +146,20 @@ func TestCompareProjectsDetectsLostFunctions(t *testing.T) {
 		}
 	}
 }
+
+// A project that is already on V2 (event group in V2 layout) compared with
+// itself is identical: no V1 interpretation of its event tags.
+func TestCompareProjectsAlreadyV2(t *testing.T) {
+	_, after := migratedServicesFixture(t)
+	report, err := CompareProjects(after, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's deliberate BatchInfo.Comment reference is the only finding.
+	if report.Summary.Missing != 1 || report.Summary.Unexplained != 0 || report.Summary.Expected != 0 {
+		for _, finding := range report.Findings {
+			t.Logf("%+v", finding)
+		}
+		t.Fatalf("summary = %+v", report.Summary)
+	}
+}

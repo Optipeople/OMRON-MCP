@@ -382,7 +382,7 @@ func (c *comparer) compareLibraries() {
 		switch {
 		case newSet[strings.ToLower(name)]:
 			c.record("library", name, CompareIdentical, nil, "")
-		case isCloudFBLibrary(name) && hasV2:
+		case (isCloudFBLibrary(name) || isV2Library(name)) && hasV2:
 			c.record("library", name, CompareExpected, []string{"LIB-REPLACE"}, "erstattet af "+strings.Join(c.new.libraries, ", "))
 		default:
 			c.record("library", name, CompareMissing, nil, "library-reference mangler i det nye projekt")
@@ -1342,7 +1342,8 @@ func (c *comparer) findNewVariable(name string) (SLWDVariable, bool) {
 }
 
 func (c *comparer) compareEventGroup(variable SLWDVariable) {
-	oldTags, oldNoOf := eventGroupTags(variable.InitialValue, false)
+	oldV2 := strings.Contains(variable.InitialValue, "Event_Type")
+	oldTags, oldNoOf := eventGroupTags(variable.InitialValue, oldV2)
 	updated, ok := c.findNewVariable(variable.Name)
 	if !ok {
 		c.record("event", variable.Name, CompareMissing, nil, "eventgruppen findes ikke i det nye projekt")
@@ -1354,6 +1355,7 @@ func (c *comparer) compareEventGroup(variable SLWDVariable) {
 		// Same Cloud_FB layout on both sides (no migration).
 		newTags, newNoOf = eventGroupTags(updated.InitialValue, false)
 	}
+	alreadyV2 := oldV2 && v2
 	oldUse, newUse := c.old.eventUsage(variable.Name), c.new.eventUsage(variable.Name)
 	mapping := &compareEventMap{index: map[int]int{}, stopCause: map[int]bool{}}
 	matched := map[int]bool{}
@@ -1369,7 +1371,7 @@ func (c *comparer) compareEventGroup(variable SLWDVariable) {
 			}
 			mapping.index[tag.index] = candidate.index
 			matched[candidate.index] = true
-			if v2 && tag.kind == "Stop_Registered" {
+			if v2 && !oldV2 && tag.kind == "Stop_Registered" {
 				mapping.stopCause[tag.index] = true
 			}
 			break
@@ -1399,6 +1401,9 @@ func (c *comparer) compareEventGroup(variable SLWDVariable) {
 		return kept, len(use.refs) > 0 && !kept
 	}
 	describeOld := func(tag eventTag) string {
+		if oldV2 {
+			return fmt.Sprintf("%s, Stop_Cause %s, machine %d, offset %s", tag.kind, stQuote(tag.cause), tag.machine, tag.offset)
+		}
 		return fmt.Sprintf("EventCode %s, machine %d, offset %s", stQuote(tag.code), tag.machine, tag.offset)
 	}
 	describeNew := func(tag eventTag) string {
@@ -1441,7 +1446,7 @@ func (c *comparer) compareEventGroup(variable SLWDVariable) {
 				}
 			}
 			entry.New = describeNew(newTag)
-			entry.Class, entry.Rules, entry.Detail = c.compareEventUse(tag, newTag, oldUse[tag.index], newUse[target], v2)
+			entry.Class, entry.Rules, entry.Detail = c.compareEventUse(tag, newTag, oldUse[tag.index], newUse[target], v2, alreadyV2)
 		}
 		c.report.Events = append(c.report.Events, entry)
 		c.record("event", fmt.Sprintf("%s.EventTags[%d]", variable.Name, tag.index), entry.Class, entry.Rules, entry.Detail)
@@ -1467,7 +1472,7 @@ func (c *comparer) isRemoved(section string) bool {
 	return c.removed[strings.ToLower(section)]
 }
 
-func (c *comparer) compareEventUse(old, updated eventTag, oldUse, newUse *eventUse, v2 bool) (CompareClass, []string, string) {
+func (c *comparer) compareEventUse(old, updated eventTag, oldUse, newUse *eventUse, v2, alreadyV2 bool) (CompareClass, []string, string) {
 	if oldUse == nil {
 		oldUse = newEventUse()
 	}
@@ -1545,7 +1550,7 @@ func (c *comparer) compareEventUse(old, updated eventTag, oldUse, newUse *eventU
 	if len(problems) > 0 {
 		return CompareUnexplained, nil, strings.Join(problems, "; ")
 	}
-	if !v2 && old.index == updated.index && old.code == updated.code {
+	if (!v2 || alreadyV2) && old.index == updated.index && old.code == updated.code && old.kind == updated.kind {
 		return CompareIdentical, nil, ""
 	}
 	rules := []string{"EVENT-LAYOUT"}
