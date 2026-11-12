@@ -1566,7 +1566,7 @@ func (c *comparer) compareEventUse(old, updated eventTag, oldUse, newUse *eventU
 // ---- part counter / telemetry tag groups ----
 
 func (c *comparer) compareTagGroups() {
-	kinds := []struct{ old, kind string }{{"sTagGroupSetting", "emnetæller"}, {"sTelemtryGroupSetting", "telemetri"}}
+	kinds := []struct{ old, kind string }{{"sTagGroupSetting", "emnetæller"}, {"sPCTagGroupSetting", "emnetæller"}, {"sTelemtryGroupSetting", "telemetri"}}
 	for _, vars := range c.old.m.allVars() {
 		for _, variable := range vars.doc.Variables() {
 			if variable.Group == "VAR_EXTERNAL" || variable.InitialValue == "" {
