@@ -2131,6 +2131,20 @@ func (m *cloudMigration) missingMembers(pou *cloudPOU, text string) []string {
 
 func (m *cloudMigration) scanLeftovers() {
 	m.scopes = nil // variable types were migrated
+	// Variables typed with a library block or type that the new library
+	// does not define (e.g. an FB renamed between library versions).
+	for _, vars := range m.allVars() {
+		for _, variable := range vars.doc.Variables() {
+			_, namespace, short, ok := splitTypeName(variable.Type)
+			if !ok || !strings.EqualFold(strings.TrimSuffix(namespace, `\`), cloudNamespace) {
+				continue
+			}
+			if _, isFB := m.sigs[strings.ToLower(short)]; isFB || m.lookupType(variable.Type) != nil {
+				continue
+			}
+			m.unresolved("%s: %s is of type %s, which %s does not define; no automatic mapping", vars.label, variable.Name, short, m.result.Library)
+		}
+	}
 	for _, pou := range m.pous {
 		for _, body := range pou.bodies {
 			if body.deleted {

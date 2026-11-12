@@ -185,3 +185,25 @@ func TestMigrateCloudFBServicesAndStopCauses(t *testing.T) {
 		t.Errorf("second run changed: %v", again.Changes)
 	}
 }
+
+func TestMigrateCloudFBReportsTypesMissingInNewLibrary(t *testing.T) {
+	dir := writeServicesFixture(t)
+	path := filepath.Join(dir, "prog-vars.xml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("++D="+ns+"fbOpti_ProductionCounter_service\tN=Counter\tG=VAR_EXTERNAL\r\n")...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := MigrateCloudFBProgram(CloudFBMigrationOptions{ProjectRoot: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range result.Unresolved {
+		if strings.Contains(item, "Counter is of type fbOpti_ProductionCounter_service, which NX-IIOT_OptiCloud_V2_2 does not define") {
+			return
+		}
+	}
+	t.Errorf("type missing in the new library not reported: %v", result.Unresolved)
+}
