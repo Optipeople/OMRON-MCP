@@ -11,5 +11,6 @@ func sysmacTools() []tool {
 	tools = append(tools, sysmacTransactionTools()...)
 	tools = append(tools, sysmacLibraryTools()...)
 	tools = append(tools, sysmacCloudFBTools()...)
+	tools = append(tools, sysmacCompareTools()...)
 	return tools
 }

@@ -10,6 +10,7 @@ func sysmacToolHandlers() map[string]sysmacToolHandler {
 		sysmacTransactionToolHandlers(),
 		sysmacLibraryToolHandlers(),
 		sysmacCloudFBToolHandlers(),
+		sysmacCompareToolHandlers(),
 	} {
 		for name, handler := range group {
 			handlers[name] = handler

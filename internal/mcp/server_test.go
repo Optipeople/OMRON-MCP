@@ -46,8 +46,8 @@ func TestServerNegotiatesCurrentProtocolAndListsAllTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	if len(list.Tools) != 20 {
-		t.Fatalf("tools = %d, want 20", len(list.Tools))
+	if len(list.Tools) != 21 {
+		t.Fatalf("tools = %d, want 21", len(list.Tools))
 	}
 }
 
