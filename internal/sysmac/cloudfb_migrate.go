@@ -18,10 +18,18 @@ import (
 // 2.0.x library reference was already replaced by NX-IIOT_OptiCloud_V2 (see
 // ReplaceLibrary). It reproduces the manual migration guide:
 //
-//   - instances of fbCloudConnect, fbCloud_TagGroup and fbCloud_EventGroup are
-//     deleted and replaced by ConnectionManager (fbConnectionManager),
-//     ProductionCounterService (fbOpti_ProductionData_service) and
-//     EventService (fbOpti_Event_Service), appended to the VAR section;
+//   - instances of fbCloudConnect, fbCloud_TagGroup, fbCloud_EventGroup,
+//     fbCloud_Telemetry and fbCloud_Batch are deleted and replaced by
+//     ConnectionManager (fbConnectionManager), ProductionCounterService
+//     (fbOpti_ProductionData_service), EventService (fbOpti_Event_Service),
+//     TelemetryService (fbOpti_Telemetry_Service) and BatchService
+//     (fbOpti_Batch_Service), appended to the VAR section;
+//   - renamed struct members are renamed in code and initial values
+//     (sBatchData.ExpectedLineSpeed → ExpectedSpeed);
+//   - event tags the code uses beyond the per machine triple are kept as
+//     extra events (never dropped), and EventTags[n].EventCode becomes
+//     Stop_Cause where the tag is a Stop_Registered event and every write is
+//     a stop cause literal;
 //   - sTagGroupSetting/sTagData become sPCTagGroupSetting/sPCTagData, the
 //     buffer bound to the tag group FB becomes ARRAY OF sPCSample, and unused
 //     local sTagGroupSetting variables (tagGroupCountersCFG) are deleted;
@@ -60,14 +68,27 @@ var cloudFBMappings = []*cloudFBMapping{
 		"eventbuffer":             "Buffer",
 		"eventgroupbuffersetting": "BufferSetting",
 	}},
+	// Same parameters as the old FB apart from the three renamed group pins
+	// (signatures of Cloud_FB 2.0.13 and NX-IIOT_OptiCloud_V2_7).
+	{OldFB: "fbCloud_Telemetry", NewFB: "fbOpti_Telemetry_Service", Instance: "TelemetryService", Pins: map[string]string{
+		"telemetrygroupsetting":       "ServiceSetting",
+		"telemetrygroupbuffer":        "Buffer",
+		"telemetrygroupbuffersetting": "BufferSetting",
+	}},
+	// Same parameter names; V2 has no Product_Info input (the pin is
+	// removed and its binding reported).
+	{OldFB: "fbCloud_Batch", NewFB: "fbOpti_Batch_Service", Instance: "BatchService"},
 }
-
-// Old function blocks without an automatic migration.
-var cloudFBUnsupported = []string{"fbCloud_Telemetry", "fbCloud_Batch"}
 
 var cloudTypeRenames = []struct{ Old, New string }{
 	{"sTagGroupSetting", "sPCTagGroupSetting"},
 	{"sTagData", "sPCTagData"},
+}
+
+// cloudMemberRenames are struct members renamed between Cloud_FB 2.0.x and
+// V2 (sBatchData.ExpectedLineSpeed UINT → sBatchData.ExpectedSpeed UINT).
+var cloudMemberRenames = []struct{ Type, Old, New string }{
+	{"sBatchData", "ExpectedLineSpeed", "ExpectedSpeed"},
 }
 
 const (
@@ -153,7 +174,13 @@ type cloudPOU struct {
 type cloudEventRemap struct {
 	variable string
 	index    map[int]int
+	// stopCause marks old indices whose EventCode references become
+	// Stop_Cause (the tag is a Stop_Registered event in V2).
+	stopCause map[int]bool
 }
+
+// eventCodeMemberPattern matches ".EventCode" after "EventTags[n]".
+var eventCodeMemberPattern = regexp.MustCompile(`(?i)^\s*\.\s*(EventCode)\b`)
 
 type cloudMigration struct {
 	options    CloudFBMigrationOptions
@@ -168,6 +195,10 @@ type cloudMigration struct {
 	eventMaps  []*cloudEventRemap
 	bufferVars map[string]bool
 	machineRef string
+	scopes     map[*cloudPOU]map[string]string
+	// readOnly loads a project for analysis (sysmac_program_compare): the
+	// Cloud_FB library is accepted and nothing is written.
+	readOnly bool
 }
 
 // MigrateCloudFBProgram runs the Cloud_FB → NX-IIOT_OptiCloud_V2 program
@@ -257,18 +288,25 @@ func (m *cloudMigration) load() error {
 	var library *oemTextEntity
 	for _, candidate := range m.doc.topLevelLibraries() {
 		if findChildFB(m.doc, candidate, "fbCloudConnect") != nil {
-			return fmt.Errorf("the project still references %s with fbCloudConnect; run sysmac_library_replace first", m.doc.attr(candidate, "name"))
+			if !m.readOnly {
+				return fmt.Errorf("the project still references %s with fbCloudConnect; run sysmac_library_replace first", m.doc.attr(candidate, "name"))
+			}
+			library = candidate
 		}
 		if findChildFB(m.doc, candidate, "fbConnectionManager") != nil {
 			library = candidate
 		}
 	}
-	if library == nil {
+	m.sigs, m.types = map[string][]fbParam{}, map[string]*libType{}
+	if library == nil && !m.readOnly {
 		return errors.New("no referenced library with fbConnectionManager (NX-IIOT_OptiCloud_V2) found; run sysmac_library_replace first")
 	}
-	m.result.Library = m.doc.attr(library, "name")
-	m.sigs, m.types = map[string][]fbParam{}, map[string]*libType{}
-	for _, entity := range subtreeEntities(library) {
+	var libraryEntities []*oemTextEntity
+	if library != nil {
+		m.result.Library = m.doc.attr(library, "name")
+		libraryEntities = subtreeEntities(library)
+	}
+	for _, entity := range libraryEntities {
 		switch m.doc.entityType(entity) {
 		case "FunctionBlock", "Function":
 			for _, child := range entity.children {
@@ -626,11 +664,6 @@ func (m *cloudMigration) analyzeInstances() {
 		for _, variable := range pou.vars.doc.Variables() {
 			mapping := oldFBMapping(variable.Type)
 			if mapping == nil {
-				for _, name := range cloudFBUnsupported {
-					if isCloudScalarType(variable.Type, name) {
-						m.unresolved("%s: %s is of type %s, which has no automatic migration (V2: fbOpti_Telemetry_Service / fbOpti_Batch_Service)", pou.vars.label, variable.Name, name)
-					}
-				}
 				continue
 			}
 			if variable.Group != "VAR" {
@@ -812,13 +845,15 @@ func (m *cloudMigration) deleteIOAlarm() {
 			}
 			name := m.doc.attr(body.entity, "name")
 			reason := m.ioAlarmBlocker(body)
+			// Sections that are kept get their EventCode references migrated
+			// to Stop_Cause where that is unambiguous (see eventCodeUsage);
+			// the rest is reported by scanLeftovers.
 			switch {
 			case !strings.EqualFold(name, "IOalarm"):
-				m.unresolved("%s writes EventTags[].EventCode, which does not exist in V2 (use Event_Type/Stop_Cause); section kept", body.label)
 			case reason != "":
-				m.unresolved("%s uses EventTags[].EventCode but also %s; not deleted, adapt it manually (EventCode → Stop_Cause)", body.label, reason)
+				m.warn("%s uses EventTags[].EventCode but also %s; section kept", body.label, reason)
 			case m.options.IOAlarm == "keep":
-				m.unresolved("%s uses EventTags[].EventCode (removed in V2); kept because ioalarm=keep", body.label)
+				m.warn("%s only feeds EventTags[].EventCode/Trig; kept because ioalarm=keep", body.label)
 			default:
 				body.deleted = true
 				m.change(body.label, "section deleted (it only fed EventTags[].EventCode/Trig, which V2 replaces by Event_Type/Stop_Cause)")
@@ -883,11 +918,15 @@ func (m *cloudMigration) allVars() []*cloudVars {
 	return result
 }
 
-// eventRefs returns the EventTags indices referenced by code for variable.
-func (m *cloudMigration) eventRefs(variable string) map[int]bool {
+// eventRefs returns the EventTags indices referenced by code for variable;
+// sections marked for deletion count only when includeDeleted is set.
+func (m *cloudMigration) eventRefs(variable string, includeDeleted bool) map[int]bool {
 	result := map[int]bool{}
 	for _, pou := range m.pous {
 		for _, body := range pou.bodies {
+			if body.deleted && !includeDeleted {
+				continue
+			}
 			var texts []string
 			if body.ladder != nil {
 				for _, line := range body.ladder.rungs() {
@@ -1004,7 +1043,15 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 		}
 		perMachine[machine] = append(perMachine[machine], oldEvent{index: index + low, value: element})
 	}
-	refs := m.eventRefs(variable.Name)
+	// refs (incl. sections that are deleted) decide the machines as before;
+	// used are the tags the remaining code still needs.
+	refs := m.eventRefs(variable.Name, true)
+	used := m.eventRefs(variable.Name, false)
+	istRefs := m.istEventRefs(variable.Name)
+	for index := range istRefs {
+		used[index] = true
+	}
+	usage := m.eventCodeUsage(variable.Name)
 	machines, source := m.options.MachineIDs, "machine_ids argument"
 	if len(machines) == 0 {
 		set := map[int]bool{}
@@ -1043,9 +1090,43 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 	}
 	m.result.Machines, m.result.MachineSource = machines, source
 
-	remap := &cloudEventRemap{variable: variable.Name, index: map[int]int{}}
+	remap := &cloudEventRemap{variable: variable.Name, index: map[int]int{}, stopCause: map[int]bool{}}
+	newTypes := map[int]string{}
 	var tags []*stLiteral
-	for position, machine := range machines {
+	build := func(machine int, eventName string, source *oldEvent) error {
+		newIndex := low + len(tags)
+		values := map[string]*stLiteral{
+			"name":       stScalar(stQuote("state")),
+			"event_type": stScalar(eventName),
+			"stop_cause": stScalar("''"),
+			"machineid":  stScalar(strconv.Itoa(machine)),
+		}
+		if source != nil {
+			remap.index[source.index] = newIndex
+			for _, field := range source.value.fields {
+				key := strings.ToLower(field.name)
+				if key == "name" || key == "value" || key == "trig" || key == "sampletime_offset" {
+					values[key] = field.value
+				}
+			}
+			if code := stString(source.value.field("EventCode")); eventName == "Stop_Registered" && code != "" {
+				values["stop_cause"] = stScalar(stQuote(code))
+			}
+		}
+		tag, err := m.recordWith(eventType, values)
+		if err != nil {
+			return err
+		}
+		tags = append(tags, tag)
+		newTypes[newIndex] = eventName
+		return nil
+	}
+	type extraEvent struct {
+		machine int
+		event   oldEvent
+	}
+	var extras []extraEvent
+	for _, machine := range machines {
 		events := perMachine[machine]
 		taken := make([]bool, len(events))
 		pick := func(kind int) *oldEvent {
@@ -1053,8 +1134,7 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 				if taken[index] {
 					continue
 				}
-				code := strings.ToLower(stString(event.value.field("EventCode")))
-				if kind == 0 && code == "runtime" || kind == 1 && code == "downtime" || kind == 2 && code != "runtime" && code != "downtime" {
+				if eventTypeForCode(stString(event.value.field("EventCode"))) == cloudEventTypes[kind] {
 					taken[index] = true
 					return &events[index]
 				}
@@ -1062,50 +1142,101 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 			return nil
 		}
 		for kind, eventName := range cloudEventTypes {
-			newIndex := low + 3*position + kind
-			source := pick(kind)
-			values := map[string]*stLiteral{
-				"name":       stScalar(stQuote("state")),
-				"event_type": stScalar(eventName),
-				"stop_cause": stScalar("''"),
-				"machineid":  stScalar(strconv.Itoa(machine)),
-			}
-			if source != nil {
-				remap.index[source.index] = newIndex
-				for _, field := range source.value.fields {
-					key := strings.ToLower(field.name)
-					if key == "name" || key == "value" || key == "trig" || key == "sampletime_offset" {
-						values[key] = field.value
-					}
-				}
-				if code := stString(source.value.field("EventCode")); kind == 2 && code != "" {
-					values["stop_cause"] = stScalar(stQuote(code))
-				}
-			}
-			tag, err := m.recordWith(eventType, values)
-			if err != nil {
+			if err := build(machine, eventName, pick(kind)); err != nil {
 				return err
 			}
-			tags = append(tags, tag)
 		}
 		for index, event := range events {
-			if !taken[index] {
-				m.warn("%s: EventTags[%d] (machine %d, EventCode %s) has no V2 counterpart and was dropped", variable.Name, event.index, machine, stQuote(stString(event.value.field("EventCode"))))
+			switch {
+			case taken[index]:
+			case used[event.index]:
+				extras = append(extras, extraEvent{machine, event})
+			default:
+				m.warn("%s: EventTags[%d] (machine %d, EventCode %s) is not used in code and has no V2 counterpart; dropped", variable.Name, event.index, machine, stQuote(stString(event.value.field("EventCode"))))
 			}
+		}
+	}
+	listed := map[int]bool{}
+	for _, machine := range machines {
+		listed[machine] = true
+	}
+	for _, machine := range machineOrder {
+		if listed[machine] {
+			continue
+		}
+		for _, event := range perMachine[machine] {
+			if used[event.index] {
+				continue // reported as used without an event
+			}
+			m.warn("%s: EventTags[%d] (machine %d, EventCode %s) dropped: machine %d is not in the machine list %v and the tag is not used in code", variable.Name, event.index, machine, stQuote(stString(event.value.field("EventCode"))), machine, machines)
+		}
+	}
+	// Event tags the code uses beyond the RUN/Stop_UnRegistered/
+	// Stop_Registered triple are kept as extra events after all triples.
+	for _, item := range extras {
+		if len(tags) >= high-low+1 {
+			return fmt.Errorf("EventTags holds %d events; %d machine triple(s) plus %d event tag(s) used in code do not fit", high-low+1, len(machines), len(extras))
+		}
+		code := stString(item.event.value.field("EventCode"))
+		eventName := eventTypeForCode(code)
+		newIndex := low + len(tags)
+		if err := build(item.machine, eventName, &item.event); err != nil {
+			return err
+		}
+		m.change(variable.Name, "EventTags[%d] (machine %d, EventCode %s) is used in code: kept as extra %s event EventTags[%d]", item.event.index, item.machine, stQuote(code), eventName, newIndex)
+		if use := usage[item.event.index]; code == "" && (use == nil || len(use.literals) == 0) {
+			m.unresolved("%s.EventTags[%d] (machine %d) has no EventCode and the code never sets one; kept as Stop_Registered with an empty Stop_Cause, check the intended event type", variable.Name, item.event.index, item.machine)
 		}
 	}
 	filler, err := m.defaultLiteral(eventType)
 	if err != nil {
 		return err
 	}
+	noOfEvent := len(tags)
 	for len(tags) < high-low+1 {
 		tags = append(tags, filler)
 	}
-	for index := range refs {
-		if _, ok := remap.index[index]; !ok {
+	// EventCode references become Stop_Cause where the target is a
+	// Stop_Registered event and every write is a stop cause literal.
+	var codeIndices []int
+	for index := range usage {
+		codeIndices = append(codeIndices, index)
+	}
+	sort.Ints(codeIndices)
+	for _, index := range codeIndices {
+		use := usage[index]
+		if index < 0 {
+			m.unresolved("%s.EventTags[<variable index>].EventCode is used in code (%s); not migrated automatically (V2: Event_Type/Stop_Cause)", variable.Name, strings.Join(use.unsafe, "; "))
+			continue
+		}
+		target, ok := remap.index[index]
+		switch {
+		case !ok:
+			// reported below as a used tag without an event
+		case newTypes[target] != "Stop_Registered":
+			m.unresolved("%s.EventTags[%d].EventCode is used in code, but the tag becomes a %s event, which has no stop cause; adapt manually", variable.Name, index, newTypes[target])
+		case len(use.unsafe) > 0:
+			m.unresolved("%s.EventTags[%d].EventCode: %s; not migrated automatically (V2: Stop_Cause of the Stop_Registered event EventTags[%d])", variable.Name, index, strings.Join(use.unsafe, "; "), target)
+		default:
+			remap.stopCause[index] = true
+			m.change(variable.Name, "EventTags[%d].EventCode → EventTags[%d].Stop_Cause (Stop_Registered event; %d read(s), %d write(s) of stop cause literals %s)", index, target, use.reads, len(use.literals), strings.Join(uniqueQuoted(use.literals), ", "))
+		}
+	}
+	var usedIndices []int
+	for index := range used {
+		usedIndices = append(usedIndices, index)
+	}
+	sort.Ints(usedIndices)
+	for _, index := range usedIndices {
+		target, ok := remap.index[index]
+		switch {
+		case !ok:
 			m.unresolved("%s.EventTags[%d] is used in code but has no event in the new layout (machines %v)", variable.Name, index, machines)
-		} else if remap.index[index] != index {
-			m.change(variable.Name, "EventTags[%d] moves to EventTags[%d]; code references are renumbered", index, remap.index[index])
+		case target != index:
+			m.change(variable.Name, "EventTags[%d] moves to EventTags[%d]; code references are renumbered", index, target)
+			if istRefs[index] {
+				m.unresolved("%s.EventTags[%d] moves to EventTags[%d], but inline ST references it; renumber the inline ST by hand", variable.Name, index, target)
+			}
 		}
 	}
 	m.eventMaps = append(m.eventMaps, remap)
@@ -1124,7 +1255,7 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 	}
 	literal, err := m.recordWith(variable.Type, map[string]*stLiteral{
 		"name":                             stScalar("'MachineState'"),
-		"noof_event":                       stScalar(strconv.Itoa(3 * len(machines))),
+		"noof_event":                       stScalar(strconv.Itoa(noOfEvent)),
 		"eventtags":                        compressArray(tags),
 		"noof_retry_before_cancel_message": retry,
 		"waittime_before_retry":            wait,
@@ -1138,9 +1269,160 @@ func (m *cloudMigration) migrateEventGroup(vars *cloudVars, variable SLWDVariabl
 			return err
 		}
 		vars.changed = true
-		m.change(vars.label+"/"+variable.Name, "initial value: %d machine(s) %v × RUN/Stop_UnRegistered/Stop_Registered, NoOf_Event %d, retry %s / %s (machines from %s)", len(machines), machines, 3*len(machines), retry.format(), wait.format(), m.result.MachineSource)
+		extra := ""
+		if len(extras) > 0 {
+			extra = fmt.Sprintf(" + %d extra event(s) used in code", len(extras))
+		}
+		m.change(vars.label+"/"+variable.Name, "initial value: %d machine(s) %v × RUN/Stop_UnRegistered/Stop_Registered%s, NoOf_Event %d, retry %s / %s (machines from %s)", len(machines), machines, extra, noOfEvent, retry.format(), wait.format(), m.result.MachineSource)
 	}
 	return nil
+}
+
+// eventTypeForCode maps a Cloud_FB EventCode to the V2 event type: Runtime
+// and Downtime are machine states, any other code is a registered stop
+// whose cause is the code.
+func eventTypeForCode(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "runtime":
+		return "RUN"
+	case "downtime":
+		return "Stop_UnRegistered"
+	}
+	return "Stop_Registered"
+}
+
+func uniqueQuoted(values []string) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, stQuote(value))
+		}
+	}
+	return result
+}
+
+// eventCodeUse describes how code uses EventTags[n].EventCode.
+type eventCodeUse struct {
+	reads    int
+	literals []string // string literals moved into EventCode
+	unsafe   []string // uses that cannot be mapped to Stop_Cause safely
+}
+
+func eventCodeRefPattern(variable string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.])` + regexp.QuoteMeta(variable) + `\s*\.\s*EventTags\s*\[\s*([^\]]*?)\s*\]\s*\.\s*EventCode\b`)
+}
+
+// eventCodeUsage classifies every EventCode reference of variable in the
+// sections that are kept, by old EventTags index (-1: non-constant index).
+func (m *cloudMigration) eventCodeUsage(variable string) map[int]*eventCodeUse {
+	pattern := eventCodeRefPattern(variable)
+	result := map[int]*eventCodeUse{}
+	get := func(raw string) *eventCodeUse {
+		index, err := strconv.Atoi(raw)
+		if err != nil {
+			index = -1
+		}
+		if result[index] == nil {
+			result[index] = &eventCodeUse{}
+		}
+		return result[index]
+	}
+	each := func(text string, fn func(use *eventCodeUse)) {
+		for _, match := range pattern.FindAllStringSubmatch(text, -1) {
+			fn(get(match[1]))
+		}
+	}
+	for _, pou := range m.pous {
+		for _, body := range pou.bodies {
+			if body.deleted {
+				continue
+			}
+			if body.ladder == nil {
+				each(body.text, func(use *eventCodeUse) {
+					use.unsafe = append(use.unsafe, body.label+" (structured text) uses it")
+				})
+				continue
+			}
+			for rung, line := range body.ladder.rungs() {
+				where := fmt.Sprintf("%s rung %d", body.label, rung)
+				line.node.walk(func(object *ladderJSON) {
+					switch kind := object.str("__type"); kind {
+					case "IST":
+						each(object.str("TXT"), func(use *eventCodeUse) {
+							use.unsafe = append(use.unsafe, where+": inline ST uses it")
+						})
+					case "F", "FB":
+						literal, isMove := "", kind == "F" && strings.EqualFold(object.str("Name"), "MOVE")
+						if in := object.get("In"); in != nil {
+							for _, pin := range in.items {
+								if strings.EqualFold(pin.str("Arg"), "In") {
+									literal = strings.TrimSpace(pin.str("Var"))
+								}
+								each(pin.str("Var"), func(use *eventCodeUse) { use.reads++ })
+							}
+						}
+						if out := object.get("Out"); out != nil {
+							for _, pin := range out.items {
+								each(pin.str("Var"), func(use *eventCodeUse) {
+									switch {
+									case !isMove:
+										use.unsafe = append(use.unsafe, fmt.Sprintf("%s: written by %s", where, object.str("Name")))
+									case !strings.HasPrefix(literal, "'") || !strings.HasSuffix(literal, "'") || len(literal) < 2:
+										use.unsafe = append(use.unsafe, fmt.Sprintf("%s: MOVE from %s (not a string literal)", where, literal))
+									case eventTypeForCode(stString(stScalar(literal))) != "Stop_Registered":
+										use.unsafe = append(use.unsafe, fmt.Sprintf("%s: MOVE %s (an event type, not a stop cause)", where, literal))
+									default:
+										use.literals = append(use.literals, stString(stScalar(literal)))
+									}
+								})
+							}
+						}
+						if value := object.get("Var"); value != nil && value.kind == 's' {
+							each(object.str("Var"), func(use *eventCodeUse) { use.reads++ })
+						}
+					case "PRM", "PF":
+						// handled with their F/FB box
+					default:
+						if value := object.get("Var"); value != nil && value.kind == 's' {
+							each(object.str("Var"), func(use *eventCodeUse) {
+								if kind == "ST" {
+									use.unsafe = append(use.unsafe, where+": coil on it")
+								} else {
+									use.reads++
+								}
+							})
+						}
+					}
+				})
+			}
+		}
+	}
+	return result
+}
+
+// istEventRefs returns the EventTags indices of variable referenced in
+// inline ST boxes of the sections that are kept.
+func (m *cloudMigration) istEventRefs(variable string) map[int]bool {
+	pattern := regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.])` + regexp.QuoteMeta(variable) + `\s*\.\s*EventTags\s*\[\s*(\d+)\s*\]`)
+	result := map[int]bool{}
+	for _, pou := range m.pous {
+		for _, body := range pou.bodies {
+			if body.deleted || body.ladder == nil {
+				continue
+			}
+			for _, line := range body.ladder.rungs() {
+				for _, text := range istTexts(line.node) {
+					for _, match := range pattern.FindAllStringSubmatch(text, -1) {
+						index, _ := strconv.Atoi(match[1])
+						result[index] = true
+					}
+				}
+			}
+		}
+	}
+	return result
 }
 
 // recordWith builds a struct literal of typ with the given member values
@@ -1166,6 +1448,30 @@ func (m *cloudMigration) recordWith(typ string, values map[string]*stLiteral) (*
 
 // ---- ladder ----
 
+// varType returns the declared type of name as seen from pou (local or
+// external declaration first, then the global variables), "" if unknown.
+func (m *cloudMigration) varType(pou *cloudPOU, name string) string {
+	if m.scopes == nil {
+		m.scopes = map[*cloudPOU]map[string]string{}
+	}
+	scope, ok := m.scopes[pou]
+	if !ok {
+		scope = map[string]string{}
+		for _, vars := range m.globals {
+			for _, variable := range vars.doc.Variables() {
+				scope[strings.ToLower(variable.Name)] = variable.Type
+			}
+		}
+		if pou != nil && pou.vars != nil {
+			for _, variable := range pou.vars.doc.Variables() {
+				scope[strings.ToLower(variable.Name)] = variable.Type
+			}
+		}
+		m.scopes[pou] = scope
+	}
+	return scope[strings.ToLower(name)]
+}
+
 // renameRefs renames old FB instances (and their members) and renumbers
 // event tag indices in a variable reference.
 func (m *cloudMigration) renameRefs(pou *cloudPOU, text string) string {
@@ -1179,6 +1485,17 @@ func (m *cloudMigration) renameRefs(pou *cloudPOU, text string) string {
 			return true
 		}
 		word := text[start:end]
+		if typ := m.varType(pou, word); typ != "" && end < len(text) && text[end] == '.' {
+			memberEnd := end + 1
+			for memberEnd < len(text) && isSTIdentChar(text[memberEnd]) {
+				memberEnd++
+			}
+			for _, rename := range cloudMemberRenames {
+				if isCloudScalarType(typ, rename.Type) && strings.EqualFold(text[end+1:memberEnd], rename.Old) {
+					edits = append(edits, edit{end + 1, memberEnd, rename.New})
+				}
+			}
+		}
 		for _, instance := range pou.instances {
 			if !strings.EqualFold(word, instance.OldName) {
 				continue
@@ -1204,6 +1521,12 @@ func (m *cloudMigration) renameRefs(pou *cloudPOU, text string) string {
 				index, _ := strconv.Atoi(text[offset+match[2] : offset+match[3]])
 				if target, ok := remap.index[index]; ok && target != index {
 					edits = append(edits, edit{offset + match[2], offset + match[3], strconv.Itoa(target)})
+				}
+				if remap.stopCause[index] {
+					rest := offset + match[1]
+					if member := eventCodeMemberPattern.FindStringSubmatchIndex(text[rest:]); member != nil {
+						edits = append(edits, edit{rest + member[2], rest + member[3], "Stop_Cause"})
+					}
 				}
 			}
 		}
@@ -1257,11 +1580,6 @@ func (m *cloudMigration) migrateRung(pou *cloudPOU, body *cloudBody, rung int, n
 		if mapping != nil {
 			target = mapping.NewFB
 		}
-		for _, unsupported := range cloudFBUnsupported {
-			if strings.EqualFold(short, unsupported) {
-				m.unresolved("%s rung %d: call of %s has no automatic migration", body.label, rung, short)
-			}
-		}
 		params, ok := m.sigs[strings.ToLower(target)]
 		if !ok || !strings.Contains(strings.ToLower(name), strings.ToLower(cloudNamespace)) {
 			if mapping != nil {
@@ -1273,6 +1591,9 @@ func (m *cloudMigration) migrateRung(pou *cloudPOU, body *cloudBody, rung int, n
 		if mapping != nil {
 			pins = mapping.Pins
 			fb.set("Name", ladderString(name[:len(name)-len(short)]+target))
+		}
+		for _, binding := range droppedBindings(fb, params, pins) {
+			m.warn("%s rung %d: %s has no parameter %s; its binding to %s is removed (check that the function is not needed)", body.label, rung, target, binding[0], binding[1])
 		}
 		description, shift, err := resyncFBPins(node, fb, params, pins)
 		if err != nil {
@@ -1308,6 +1629,37 @@ func (m *cloudMigration) migrateRung(pou *cloudPOU, body *cloudBody, rung int, n
 		}
 	})
 	return nil
+}
+
+// droppedBindings returns [pin, binding] for bound PRM pins of an FB box that
+// have no parameter in the new signature.
+func droppedBindings(fb *ladderJSON, params []fbParam, renames map[string]string) [][2]string {
+	var result [][2]string
+	seen := map[string]bool{}
+	for _, list := range []*ladderJSON{fb.get("In"), fb.get("Out")} {
+		if list == nil {
+			continue
+		}
+		for _, pin := range list.items {
+			arg, binding := pin.str("Arg"), strings.TrimSpace(pin.str("Var"))
+			if pin.str("__type") != "PRM" || binding == "" || seen[strings.ToLower(arg)] {
+				continue
+			}
+			name := arg
+			if renamed, ok := renames[strings.ToLower(arg)]; ok {
+				name = renamed
+			}
+			found := false
+			for _, param := range params {
+				found = found || strings.EqualFold(param.Name, name)
+			}
+			if !found {
+				seen[strings.ToLower(arg)] = true
+				result = append(result, [2]string{arg, binding})
+			}
+		}
+	}
+	return result
 }
 
 func pinIx(pin *ladderJSON) int {
@@ -1663,6 +2015,15 @@ func (m *cloudMigration) convertInitialValue(variable SLWDVariable, oldType, new
 			set("WaitTime_before_retry", stScalar("T#10S"), "WaitTime_before_retry := T#10S")
 		}
 		m.checkTagTypes(variable.Name, literal)
+		// OptiCloud maps counters by position and name in the published tag
+		// list: it must survive 1:1, empty slots included.
+		if variable.InitialValue != "" {
+			oldTags, oldSettings := tagGroupSummary(variable.InitialValue)
+			newTags, newSettings := tagGroupSummary(literal.format())
+			if strings.Join(oldTags, "|") != strings.Join(newTags, "|") || oldSettings["noof_tag"] != newSettings["noof_tag"] {
+				m.unresolved("%s: the part counter tag list changed during conversion (before [%s], after [%s]); OptiCloud maps counters by position and name", variable.Name, strings.Join(oldTags, "; "), strings.Join(newTags, "; "))
+			}
+		}
 		return literal.format(), "converted to sPCTagGroupSetting (" + strings.Join(notes, ", ") + ")", nil
 	case isCloudType(oldType, "sTagData") && !isCloudScalarType(oldType, "sTagData"):
 		var old *stLiteral
@@ -1678,8 +2039,46 @@ func (m *cloudMigration) convertInitialValue(variable SLWDVariable, oldType, new
 			return "", "", err
 		}
 		return literal.format(), "set to the sPCTagData default", nil
+	case variable.InitialValue != "" && len(m.memberRenames(oldType)) > 0:
+		old, err := parseSTLiteral(variable.InitialValue)
+		if err != nil {
+			return "", "", fmt.Errorf("parse initial value: %w", err)
+		}
+		var notes []string
+		for index, field := range old.fields {
+			for _, rename := range m.memberRenames(oldType) {
+				if strings.EqualFold(field.name, rename.Old) {
+					old.fields[index].name = rename.New
+					notes = append(notes, rename.Old+" → "+rename.New)
+				}
+			}
+		}
+		literal, err := m.convertLiteral(old, newType, variable.Name)
+		if err != nil {
+			return "", "", err
+		}
+		return literal.format(), "members renamed (" + strings.Join(notes, ", ") + ")", nil
+	}
+	if definition := m.lookupType(newType); definition != nil && isCloudScalarType(newType, definition.Name) && strings.EqualFold(definition.Base, "ENUM") && variable.InitialValue != "" {
+		found := false
+		for _, member := range definition.Members {
+			found = found || strings.EqualFold(member.Name, strings.TrimSpace(variable.InitialValue))
+		}
+		if !found {
+			m.unresolved("%s: initial value %s is not a member of %s in %s", variable.Name, variable.InitialValue, definition.Name, m.result.Library)
+		}
 	}
 	return variable.InitialValue, "", nil
+}
+
+func (m *cloudMigration) memberRenames(typ string) []struct{ Type, Old, New string } {
+	var result []struct{ Type, Old, New string }
+	for _, rename := range cloudMemberRenames {
+		if isCloudScalarType(typ, rename.Type) {
+			result = append(result, rename)
+		}
+	}
+	return result
 }
 
 func (m *cloudMigration) checkTagTypes(name string, setting *stLiteral) {
@@ -1697,7 +2096,41 @@ func (m *cloudMigration) checkTagTypes(name string, setting *stLiteral) {
 
 var oldCloudNames = []string{"fbCloudConnect", "fbCloud_TagGroup", "fbCloud_EventGroup", "fbCloud_Telemetry", "fbCloud_Batch", "sTagGroupSetting", "sTagData", "ssTagSetting"}
 
+// missingMembers reports "var.member" references to scalar variables of a
+// library struct type that has no such member.
+func (m *cloudMigration) missingMembers(pou *cloudPOU, text string) []string {
+	var problems []string
+	scanIdentifiers(text, func(start, end int, prevDot bool) bool {
+		if prevDot || end >= len(text) || text[end] != '.' {
+			return true
+		}
+		typ := m.varType(pou, text[start:end])
+		array, _, short, ok := splitTypeName(typ)
+		if !ok || array != "" || !isCloudType(typ, short) {
+			return true
+		}
+		definition := m.lookupType(typ)
+		if definition == nil || !strings.EqualFold(definition.Base, "STRUCT") {
+			return true
+		}
+		memberEnd := end + 1
+		for memberEnd < len(text) && isSTIdentChar(text[memberEnd]) {
+			memberEnd++
+		}
+		member := text[end+1 : memberEnd]
+		for _, candidate := range definition.Members {
+			if strings.EqualFold(candidate.Name, member) {
+				return true
+			}
+		}
+		problems = append(problems, fmt.Sprintf("%s is not a member of %s in %s", text[start:memberEnd], definition.Name, m.result.Library))
+		return true
+	})
+	return problems
+}
+
 func (m *cloudMigration) scanLeftovers() {
+	m.scopes = nil // variable types were migrated
 	for _, pou := range m.pous {
 		for _, body := range pou.bodies {
 			if body.deleted {
@@ -1720,6 +2153,9 @@ func (m *cloudMigration) scanLeftovers() {
 				for _, value := range ladderVars(line.node) {
 					if eventCodeRef.MatchString(value) {
 						m.unresolved("%s rung %d still uses %s", body.label, index, value)
+					}
+					for _, problem := range m.missingMembers(pou, value) {
+						m.unresolved("%s rung %d: %s", body.label, index, problem)
 					}
 					for _, instance := range pou.instances {
 						prefix := strings.ToLower(instance.NewName) + "."
@@ -1862,4 +2298,48 @@ func entityParentID(entity *oemTextEntity) string {
 		return ""
 	}
 	return entity.parent.id
+}
+
+// tagGroupSummary lists the published tags of a part counter or telemetry
+// group setting ("[i] 'name' machine m type") and its other settings.
+func tagGroupSummary(value string) ([]string, map[string]string) {
+	literal, err := parseSTLiteral(value)
+	if err != nil || value == "" {
+		return nil, nil
+	}
+	settings := map[string]string{}
+	for _, field := range literal.fields {
+		if !strings.EqualFold(field.name, "TagSetting") {
+			settings[strings.ToLower(field.name)] = field.value.format()
+		}
+	}
+	// OptiCloud maps counters by position and name in the published tag
+	// list, so every slot up to NoOf_Tag (or the last named tag) counts,
+	// empty ones included.
+	elements := literal.field("TagSetting").expand()
+	count := 0
+	if field := literal.field("NoOf_Tag"); field != nil {
+		count, _ = strconv.Atoi(strings.TrimSpace(field.scalar))
+	}
+	for index, element := range elements {
+		if stString(element.field("Name")) != "" && index+1 > count {
+			count = index + 1
+		}
+	}
+	var tags []string
+	for index, element := range elements {
+		if index >= count {
+			break
+		}
+		name := stString(element.field("Name"))
+		machine, kind := "", ""
+		if value := element.field("MachineId"); value != nil {
+			machine = value.scalar
+		}
+		if value := element.field("TagType"); value != nil {
+			kind = value.scalar
+		}
+		tags = append(tags, fmt.Sprintf("[%d] %s machine %s %s", index, stQuote(name), machine, kind))
+	}
+	return tags, settings
 }

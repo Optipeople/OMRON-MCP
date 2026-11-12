@@ -286,12 +286,15 @@ func TestMigrateCloudFBProgram(t *testing.T) {
 	if !strings.Contains(oem, `id="b-tags" name="Tags" version="0" dateLastModified="11/11/2026 12:00:00"`) {
 		t.Error("modified body not stamped")
 	}
-	reported := false
-	for _, item := range result.Unresolved {
-		reported = reported || strings.Contains(item, "IOalarm2 writes EventTags[].EventCode")
+	// IOalarm2 (not named IOalarm) is kept; its stop cause literal now goes
+	// to Stop_Cause of the Stop_Registered event.
+	if alarm2 := readFixture(t, dir, "b-alarm2.xml"); !strings.Contains(alarm2, `"Var":"eventGroup.EventTags[2].Stop_Cause"`) {
+		t.Errorf("IOalarm2 EventCode not migrated: %s", alarm2)
 	}
-	if !reported {
-		t.Errorf("IOalarm2 not reported: %v", result.Unresolved)
+	for _, item := range result.Unresolved {
+		if strings.Contains(item, "EventCode") {
+			t.Errorf("unexpected EventCode finding: %s", item)
+		}
 	}
 	if _, err := Inspect(dir); err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -322,11 +325,22 @@ func TestMigrateCloudFBKeepsIOAlarmWithOtherLogic(t *testing.T) {
 		t.Fatal("IOalarm with other logic was deleted")
 	}
 	found := false
-	for _, item := range result.Unresolved {
+	for _, item := range result.Warnings {
 		found = found || strings.Contains(item, "Cloud/IOalarm uses EventTags[].EventCode but also a coil on Horn")
 	}
 	if !found {
-		t.Errorf("not reported: %v", result.Unresolved)
+		t.Errorf("not reported: %v", result.Warnings)
+	}
+	// A coil on EventCode cannot become Stop_Cause automatically.
+	found = false
+	for _, item := range result.Unresolved {
+		found = found || strings.Contains(item, "eventGroup.EventTags[2].EventCode: Cloud/IOalarm rung 1: coil on it")
+	}
+	if !found {
+		t.Errorf("coil on EventCode not reported: %v", result.Unresolved)
+	}
+	if alarm := readFixture(t, dir, "b-alarm.xml"); strings.Contains(alarm, "Stop_Cause") {
+		t.Errorf("EventCode with an unsafe write was rewritten: %s", alarm)
 	}
 }
 
