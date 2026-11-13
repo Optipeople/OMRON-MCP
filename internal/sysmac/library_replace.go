@@ -35,6 +35,10 @@ import (
 //     replaced by the LibraryModel of the new library;
 //   - all files of the old library subtree are removed.
 //
+//   - ladder POU bodies are stored compiled (encrypted body with the inline
+//     ST, CXIL compile information in the PouBodySourceHolder); see
+//     library_ladder.go for how ReplaceLibrary handles them.
+//
 // Build artefacts (NexBuildResults, NexTransferInformation, controller .zip)
 // still reference the old library until the project is rebuilt in Sysmac
 // Studio; DN (display name) attributes are not generated.
@@ -75,7 +79,9 @@ type LibraryReplaceResult struct {
 	RemovedFiles []string    `json:"removedFiles"`
 	WrittenFiles []string    `json:"writtenFiles"`
 	SkippedFiles []string    `json:"skippedPayloads,omitempty"`
-	Warnings     []string    `json:"warnings,omitempty"`
+	// LadderPOUs reports how each ladder POU of the new library was stored.
+	LadderPOUs []LibraryCompiledPOU `json:"ladderPous,omitempty"`
+	Warnings   []string             `json:"warnings,omitempty"`
 }
 
 type librarySource struct {
@@ -368,6 +374,15 @@ func ReplaceLibrary(options LibraryReplaceOptions) (LibraryReplaceResult, error)
 		}
 	}
 
+	// Ladder POUs: reuse the compiled form of the replaced library where it
+	// provably fits, otherwise keep the plain ladder with its inline ST.
+	readOldPayload := func(id string) ([]byte, bool) {
+		data, err := os.ReadFile(filepath.Join(projectDir, id+".xml"))
+		return data, err == nil
+	}
+	result.LadderPOUs = prepareLibraryLadderPOUs(libraryDoc, idMap, newFiles, project, old, readOldPayload)
+	result.SkippedFiles = append(result.SkippedFiles, dropInlineOfEncryptedBodies(libraryDoc, idMap, newFiles)...)
+
 	// Apply: remove old files, write new files, index and ReferredLibraries.
 	oldIDs := map[string]bool{}
 	for _, entity := range oldEntities {
@@ -408,6 +423,11 @@ func ReplaceLibrary(options LibraryReplaceOptions) (LibraryReplaceResult, error)
 	result.Warnings = append(result.Warnings,
 		"Rebuild the project in Sysmac Studio: build artefacts (NexBuildResults, NexTransferInformation, controller .zip) still describe the old library.",
 		"Program code that calls POUs of the old library is not changed; renamed or removed function blocks must be adapted manually.")
+	for _, pou := range result.LadderPOUs {
+		if pou.Mode == "plain" {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Ladder POU %s {%s} of the new library is stored uncompiled (%s). The controller builds, but the simulator reports \"Build failed: %s {%s}\" until Sysmac Studio compiles the library: use Replace Library in Sysmac Studio for this library.", pou.Name, pou.Namespace, pou.Reason, pou.Name, pou.Namespace))
+		}
+	}
 	return result, nil
 }
 
@@ -457,11 +477,8 @@ func convertLibraryPayload(doc *oemTextDocument, entity *oemTextEntity, ext stri
 			return converted, true, err
 		}
 	case "Inline":
-		// Library sources are stored protected. Plain-text inline sections are
-		// not persisted by Sysmac Studio in the project.
-		if !bytes.Contains(body, []byte("EncryptedFile")) {
-			return nil, false, nil
-		}
+		// Kept for now; dropInlineOfEncryptedBodies removes plain-text inline
+		// sections whose POU body is stored encrypted (they are part of it).
 		return data, true, nil
 	case "DataType":
 		// Only the root data type group (without namespace) receives its

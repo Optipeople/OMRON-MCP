@@ -62,6 +62,16 @@ func TestRealLibraryReplaceMatchesSysmacStudio(t *testing.T) {
 		}
 		return strings.Join(parts, " ")
 	}
+	// Inline payloads are kept only below ladder bodies that stay plain.
+	plainLadder := map[string]bool{}
+	for _, pou := range got.ladderPOUs(gotLib) {
+		if data, err := os.ReadFile(filepath.Join(filepath.Dir(gotOEM), pou.body.id+".xml")); err == nil && !isEncryptedPayload(data) {
+			for _, child := range pou.inline {
+				plainLadder[child.id] = true
+			}
+		}
+	}
+	t.Logf("ladder POUs: %+v", result.LadderPOUs)
 	expectedDiff := map[string]bool{"PouBody": true, "PouBodySourceHolder": true}
 	stats := map[string]int{}
 	var walk func(a, b *oemTextEntity, path string)
@@ -73,6 +83,10 @@ func TestRealLibraryReplaceMatchesSysmacStudio(t *testing.T) {
 		gotFile, gotErr := os.ReadFile(filepath.Join(filepath.Dir(gotOEM), a.id+".xml"))
 		wantFile, wantErr := os.ReadFile(filepath.Join(filepath.Dir(wantOEM), b.id+".xml"))
 		switch {
+		case (gotErr == nil) != (wantErr == nil) && got.entityType(a) == "Inline" && gotErr == nil && !plainLadder[a.id]:
+			t.Errorf("%s (%s): inline payload stored although its body is compiled", path, got.entityType(a))
+		case (gotErr == nil) != (wantErr == nil) && got.entityType(a) == "Inline" && gotErr == nil:
+			stats["inline kept with plain ladder"]++
 		case (gotErr == nil) != (wantErr == nil):
 			t.Errorf("%s (%s): payload presence differs (got %v, want %v)", path, got.entityType(a), gotErr == nil, wantErr == nil)
 		case gotErr != nil:

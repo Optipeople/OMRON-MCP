@@ -6,7 +6,7 @@ import (
 
 func sysmacLibraryTools() []tool {
 	return []tool{
-		{Name: "sysmac_library_replace", Description: "Replace a referenced library in an extracted Sysmac Solution directory with a new .slr (archive or extracted folder), the way Sysmac Studio does it: updates the ReferredLibraries payload, removes the old library subtree and its payload files and grafts the new library subtree (including nested libraries) with new entity ids. Runs in a project transaction; without confirm_commit the changes stay staged and can be inspected with sysmac_transaction_preview and committed or rolled back. Call sites of renamed function blocks are not changed; rebuild in Sysmac Studio afterwards.", InputSchema: objectSchema(map[string]any{
+		{Name: "sysmac_library_replace", Description: "Replace a referenced library in an extracted Sysmac Solution directory with a new .slr (archive or extracted folder), the way Sysmac Studio does it: updates the ReferredLibraries payload, removes the old library subtree and its payload files and grafts the new library subtree (including nested libraries) with new entity ids. Runs in a project transaction; without confirm_commit the changes stay staged and can be inspected with sysmac_transaction_preview and committed or rolled back. Ladder POUs of the new library are stored compiled (encrypted body and CXIL compile information) by reusing the same POU of the replaced library when it provably has the same ladder; otherwise the plain ladder and its inline ST are kept and ladder_pous/warnings say that the simulator needs Replace Library in Sysmac Studio. Call sites of renamed function blocks are not changed; rebuild in Sysmac Studio afterwards.", InputSchema: objectSchema(map[string]any{
 			"project_path":      stringProperty("Extracted Sysmac Solution directory (the <GUID> folder with the .oem)"),
 			"library_path":      stringProperty("New library: .slr file or extracted .slr folder"),
 			"old_library":       stringProperty("Library to replace: entity name (e.g. Cloud_FB_2_0_13), entity id or LibraryId. Optional when only one library is referenced"),
@@ -57,7 +57,7 @@ func handleLibraryReplace(call sysmacToolCall) (map[string]any, error) {
 		_ = tx.Rollback()
 		return nil, err
 	}
-	response := map[string]any{"old_library": result.OldLibrary, "new_library": result.NewLibrary, "removed_files": len(result.RemovedFiles), "written_files": len(result.WrittenFiles), "skipped_payloads": result.SkippedFiles, "changes": len(changes), "warnings": result.Warnings}
+	response := map[string]any{"old_library": result.OldLibrary, "new_library": result.NewLibrary, "removed_files": len(result.RemovedFiles), "written_files": len(result.WrittenFiles), "skipped_payloads": result.SkippedFiles, "ladder_pous": result.LadderPOUs, "changes": len(changes), "warnings": result.Warnings}
 	if commit {
 		if err := tx.Commit(); err != nil {
 			_ = tx.Rollback()
