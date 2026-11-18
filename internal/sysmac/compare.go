@@ -53,6 +53,7 @@ var CompareRules = map[string]string{
 	"EVENT-UNUSED":    "Event-tag, som ingen kode bruger (ingen trigger), er ikke overført",
 	"IOALARM":         "IOalarm-sektion slettet: den fodrede kun EventCode/Trig, som V2 erstatter",
 	"UNUSED-CFG":      "Ubrugt lokal sTagGroupSetting-variabel slettet",
+	"LIB-SIGNATURE":   "Library-blokkens parametre er ændret i det nye library; kaldet er opdateret som Sysmacs Update (forbindelser bevaret pr. pinnavn, nye pins uden forbindelse)",
 }
 
 // CompareFinding is one difference between the projects.
@@ -193,6 +194,8 @@ type compareProject struct {
 	libraries []string
 	pous      map[string]*cloudPOU
 	order     []*cloudPOU
+	// sigs are the FB/function signatures of all referenced libraries.
+	sigs *libSigSet
 }
 
 func loadCompareProject(root string) (*compareProject, func(), error) {
@@ -225,6 +228,10 @@ func loadCompareProject(root string) (*compareProject, func(), error) {
 		project.libraries = append(project.libraries, m.doc.attr(library, "name"))
 	}
 	sort.Strings(project.libraries)
+	project.sigs = loadLibrarySignatures(m.doc, m.doc.topLevelLibraries(), func(id string) ([]byte, bool) {
+		data, err := os.ReadFile(filepath.Join(m.dir, id+".xml"))
+		return data, err == nil
+	})
 	for _, pou := range m.pous {
 		key := strings.ToLower(pou.name)
 		if _, exists := project.pous[key]; exists {
@@ -281,6 +288,9 @@ type comparer struct {
 	instances map[string]map[string]*cloudInstance // pou → old instance (lower)
 	events    map[string]*compareEventMap          // event group variable (lower)
 	removed   map[string]bool                      // "pou/section" deleted by rule IOALARM
+	// sigChanged maps new library signatures to the old ones they differ
+	// from (same namespace and name in both projects).
+	sigChanged map[*libPOUSig]*libPOUSig
 }
 
 // CompareProjects compares an old and a new project (folders or .smc2).
@@ -552,7 +562,11 @@ func (c *comparer) normalizeValue(value any, pou *cloudPOU, oldSide bool, rules 
 
 func (c *comparer) normalizeFB(fb map[string]any, pou *cloudPOU, oldSide bool, rules map[string]bool, dropped *[]string) {
 	name, _ := fb["Name"].(string)
-	if !strings.Contains(strings.ToLower(name), strings.ToLower(cloudNamespace)) {
+	// Pins of cloud FBs and of other library FBs are compared by name
+	// (unconnected pins ignored), so an updated call with new unconnected
+	// pins normalises like the old one.
+	library := c.old.sigs.resolve(name) != nil || c.new.sigs.resolve(name) != nil
+	if !library && !strings.Contains(strings.ToLower(name), strings.ToLower(cloudNamespace)) {
 		return
 	}
 	short := fbShortName(name)
@@ -778,12 +792,17 @@ func (c *comparer) compareBody(pou, newPOU *cloudPOU, body, newBody *cloudBody, 
 			c.record("section", label, CompareUnexplained, nil, "sproget er ændret")
 			return
 		}
+		detail := "structured text ændret (tekst vises ikke)"
 		if body.text == newBody.text {
 			section.Class = CompareIdentical
 		} else {
 			section.Class = CompareUnexplained
 		}
-		c.record("section", label, section.Class, nil, "structured text ændret (tekst vises ikke)")
+		if problems := c.stCallProblems(newPOU, newBody.text, "linje"); len(problems) > 0 {
+			section.Class = CompareUnexplained
+			detail = "kald passer ikke til library-definitionen: " + strings.Join(problems, "; ")
+		}
+		c.record("section", label, section.Class, nil, detail)
 		return
 	}
 	oldRungs, newRungs := body.ladder.rungs(), newBody.ladder.rungs()
@@ -815,11 +834,15 @@ func (c *comparer) compareBody(pou, newPOU *cloudPOU, body, newBody *cloudBody, 
 				rung.Class, rung.Detail = CompareUnexplained, describeRungDiff(oldNorm, newNorm)
 				break
 			}
+			signatureNotes := c.signatureUpdates(oldRungs[index].node, newRungs[index].node)
+			if len(signatureNotes) > 0 {
+				rules["LIB-SIGNATURE"] = true
+			}
 			if len(rules) == 0 {
 				rules["LAYOUT"] = true
 			}
 			rung.Class, rung.Rules = CompareExpected, sortedRules(rules)
-			var notes []string
+			notes := signatureNotes
 			for _, binding := range dropped {
 				output := strings.HasSuffix(binding, "@out")
 				binding = strings.TrimSuffix(binding, "@out")
@@ -847,6 +870,19 @@ func (c *comparer) compareBody(pou, newPOU *cloudPOU, body, newBody *cloudBody, 
 			if problems := c.invalidReferences(newPOU, newRungs[index].node); len(problems) > 0 {
 				rung.Class = CompareMissing
 				detail := "refererer til noget, der ikke findes i " + c.new.m.result.Library + ": " + strings.Join(problems, ", ")
+				if rung.Detail != "" {
+					detail = rung.Detail + "; " + detail
+				}
+				rung.Detail = detail
+			}
+			// A call whose pin list differs from the library definition
+			// fails the build ("The argument of the function or function
+			// block caller is different from the argument of the definition").
+			if problems := c.callMismatches(newPOU, newRungs[index].node); len(problems) > 0 {
+				if classRank(rung.Class) > classRank(CompareUnexplained) {
+					rung.Class = CompareUnexplained
+				}
+				detail := "kald passer ikke til library-definitionen (Sysmac-build fejler; vælg Update på kaldet eller kør sysmac_library_replace igen): " + strings.Join(problems, "; ")
 				if rung.Detail != "" {
 					detail = rung.Detail + "; " + detail
 				}
@@ -2234,4 +2270,129 @@ func (p *compareProject) references(name string) int {
 		}
 	}
 	return count
+}
+
+// ---- library signatures ----
+
+// changedSignatures maps the new library signatures to the old ones with
+// the same namespace and name that have other parameters.
+func (c *comparer) changedSignatures() map[*libPOUSig]*libPOUSig {
+	if c.sigChanged != nil {
+		return c.sigChanged
+	}
+	c.sigChanged = map[*libPOUSig]*libPOUSig{}
+	for key, sig := range c.new.sigs.byKey {
+		if old := c.old.sigs.byKey[key]; old != nil {
+			if _, differs := diffSignatures(old.Params, sig.Params); differs {
+				c.sigChanged[sig] = old
+			}
+		}
+	}
+	return c.sigChanged
+}
+
+func pinNames(call *ladderJSON) map[string]string {
+	names := map[string]string{}
+	for key, pin := range callPins(call) {
+		names[key] = pin.str("Arg")
+	}
+	return names
+}
+
+func missingNames(from, in map[string]string) []string {
+	var result []string
+	for key, name := range from {
+		if _, ok := in[key]; !ok {
+			result = append(result, name)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+// signatureUpdates describes calls of the rung that were updated to a
+// changed library signature: the library POU has other parameters in the
+// new project, the new call matches the new definition and its pin names
+// differ from the old call.
+func (c *comparer) signatureUpdates(oldNode, newNode *ladderJSON) []string {
+	oldCalls, newCalls := ladderCalls(oldNode), ladderCalls(newNode)
+	if len(oldCalls) != len(newCalls) {
+		return nil
+	}
+	changed := c.changedSignatures()
+	var notes []string
+	for index, call := range newCalls {
+		sig := c.new.sigs.resolve(call.str("Name"))
+		old, isChanged := changed[sig]
+		if sig == nil || !isChanged || c.old.sigs.resolve(oldCalls[index].str("Name")) != old {
+			continue
+		}
+		if inSync, ok := callInSync(call, sig); !ok || !inSync {
+			continue
+		}
+		oldPins, newPins := pinNames(oldCalls[index]), pinNames(call)
+		added, removed := missingNames(newPins, oldPins), missingNames(oldPins, newPins)
+		if len(added) == 0 && len(removed) == 0 {
+			continue
+		}
+		var parts []string
+		if len(added) > 0 {
+			parts = append(parts, "nye pins "+strings.Join(added, ", ")+" uden forbindelse")
+		}
+		if len(removed) > 0 {
+			parts = append(parts, "fjernede pins "+strings.Join(removed, ", "))
+		}
+		notes = append(notes, fmt.Sprintf("%s %s opdateret til ny signatur: %s", sig.Name, call.str("Var"), strings.Join(parts, "; ")))
+	}
+	return notes
+}
+
+// callMismatches lists calls of library POUs in a rung (boxes and inline
+// ST) whose arguments do not match the library definition.
+func (c *comparer) callMismatches(pou *cloudPOU, node *ladderJSON) []string {
+	var problems []string
+	for _, call := range ladderCalls(node) {
+		sig := c.new.sigs.resolve(call.str("Name"))
+		if sig == nil {
+			continue
+		}
+		inSync, ok := callInSync(call, sig)
+		if !ok || inSync {
+			continue
+		}
+		added, removed, _, retyped := callDiff(call, sig)
+		var parts []string
+		if len(added) > 0 {
+			parts = append(parts, "mangler pins "+strings.Join(added, ", "))
+		}
+		if len(removed) > 0 {
+			parts = append(parts, "pins findes ikke i definitionen: "+strings.Join(removed, ", "))
+		}
+		if len(retyped) > 0 {
+			parts = append(parts, "pintyper "+strings.Join(retyped, ", "))
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "pinrækkefølge/-layout")
+		}
+		problems = append(problems, fmt.Sprintf("%s %s: %s", sig.Name, call.str("Var"), strings.Join(parts, "; ")))
+	}
+	for _, text := range istTexts(node) {
+		problems = append(problems, c.stCallProblems(pou, text, "inline ST linje")...)
+	}
+	return problems
+}
+
+// stCallProblems checks structured text for calls of library POUs whose
+// signature changed (removed arguments, new in-out parameters, members).
+func (c *comparer) stCallProblems(pou *cloudPOU, text, unit string) []string {
+	changed := c.changedSignatures()
+	if len(changed) == 0 || text == "" || isEncryptedPayload([]byte(text)) {
+		return nil
+	}
+	var problems []string
+	typeOf := func(name string) string { return c.new.m.varType(pou, name) }
+	for _, finding := range stSignatureProblems(text, typeOf, changed, c.new.sigs) {
+		problems = append(problems, fmt.Sprintf("%s %d: %s", unit, stLine(text, finding.offset), finding.problem))
+	}
+	return problems
 }

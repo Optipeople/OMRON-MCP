@@ -81,7 +81,12 @@ type LibraryReplaceResult struct {
 	SkippedFiles []string    `json:"skippedPayloads,omitempty"`
 	// LadderPOUs reports how each ladder POU of the new library was stored.
 	LadderPOUs []LibraryCompiledPOU `json:"ladderPous,omitempty"`
-	Warnings   []string             `json:"warnings,omitempty"`
+	// SignatureChanges lists library POUs whose parameters changed;
+	// CallUpdates every call of them in the program that was updated like
+	// Sysmac Studio's Update or has to be adapted by hand.
+	SignatureChanges []LibrarySignatureChange `json:"signatureChanges,omitempty"`
+	CallUpdates      []LibraryCallUpdate      `json:"callUpdates,omitempty"`
+	Warnings         []string                 `json:"warnings,omitempty"`
 }
 
 type librarySource struct {
@@ -383,6 +388,9 @@ func ReplaceLibrary(options LibraryReplaceOptions) (LibraryReplaceResult, error)
 	result.LadderPOUs = prepareLibraryLadderPOUs(libraryDoc, idMap, newFiles, project, old, readOldPayload)
 	result.SkippedFiles = append(result.SkippedFiles, dropInlineOfEncryptedBodies(libraryDoc, idMap, newFiles)...)
 
+	// Signatures of the replaced library, read before its files are removed.
+	oldSigs := loadLibrarySignatures(project, []*oemTextEntity{old}, readOldPayload)
+
 	// Apply: remove old files, write new files, index and ReferredLibraries.
 	oldIDs := map[string]bool{}
 	for _, entity := range oldEntities {
@@ -417,12 +425,37 @@ func ReplaceLibrary(options LibraryReplaceOptions) (LibraryReplaceResult, error)
 		return result, err
 	}
 	result.WrittenFiles = append(result.WrittenFiles, filepath.Base(referredPayloadPath), filepath.Base(oemPath))
+
+	// Calls of library POUs whose parameters changed (Sysmac: Update).
+	calls, err := updateLibraryCalls(root, oldSigs, result.NewLibrary.EntityID, options.Now)
+	if err != nil {
+		result.Warnings = append(result.Warnings, "Calls of library POUs were not checked against the new signatures ("+err.Error()+"); use Update on calls in Sysmac Studio if the build reports different arguments.")
+	}
+	result.SignatureChanges, result.CallUpdates = calls.changes, calls.updates
+	written := map[string]bool{}
+	for _, name := range result.WrittenFiles {
+		written[name] = true
+	}
+	for _, name := range calls.written {
+		if !written[name] {
+			result.WrittenFiles = append(result.WrittenFiles, name)
+		}
+	}
+	for _, update := range calls.updates {
+		if update.Status == "manual" {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s %s: call of %s must be adapted by hand: %s", update.Section, update.Location, update.POU, update.Reason))
+		} else if update.Reason != "" {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s %s: call of %s updated, but %s", update.Section, update.Location, update.POU, update.Reason))
+		}
+	}
 	sort.Strings(result.RemovedFiles)
 	sort.Strings(result.WrittenFiles)
 	sort.Strings(result.SkippedFiles)
 	result.Warnings = append(result.Warnings,
-		"Rebuild the project in Sysmac Studio: build artefacts (NexBuildResults, NexTransferInformation, controller .zip) still describe the old library.",
-		"Program code that calls POUs of the old library is not changed; renamed or removed function blocks must be adapted manually.")
+		"Rebuild the project in Sysmac Studio: build artefacts (NexBuildResults, NexTransferInformation, controller .zip) still describe the old library.")
+	if len(calls.removedPOUs) > 0 {
+		result.Warnings = append(result.Warnings, "POUs of the old library that the new library does not have (calls and instances are not changed; adapt them by hand): "+strings.Join(calls.removedPOUs, ", "))
+	}
 	for _, pou := range result.LadderPOUs {
 		if pou.Mode == "plain" {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("Ladder POU %s {%s} of the new library is stored uncompiled (%s). The controller builds, but the simulator reports \"Build failed: %s {%s}\" until Sysmac Studio compiles the library: use Replace Library in Sysmac Studio for this library.", pou.Name, pou.Namespace, pou.Reason, pou.Name, pou.Namespace))

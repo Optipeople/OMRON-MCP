@@ -356,7 +356,15 @@ func (m *cloudMigration) loadSignature(entity *oemTextEntity) ([]fbParam, error)
 	if err != nil {
 		return nil, nil
 	}
+	return parseSignature(data)
+}
+
+// parseSignature returns the parameters (VAR_INPUT, VAR_OUTPUT, VAR_IN_OUT)
+// of a POU Variables payload (SLWD or the XML form of .slr archives) in
+// declaration order.
+func parseSignature(data []byte) ([]fbParam, error) {
 	data = bytes.TrimPrefix(data, []byte(utf8BOM))
+	var err error
 	if bytes.Contains(data, []byte("<VariableGroup")) {
 		if data, err = ConvertVariablesXMLToSLWD(data); err != nil {
 			return nil, err
